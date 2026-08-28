@@ -67,6 +67,20 @@ export class StateStore {
     await this.#persist();
   }
 
+  /** Every conversation key currently bound to the given session. */
+  keysBoundTo(sessionId) {
+    return Object.entries(this.#state.sessions)
+      .filter(([, boundSessionId]) => boundSessionId === sessionId)
+      .map(([key]) => key);
+  }
+
+  /** Every conversation key that currently binds any session. */
+  keysWithSession() {
+    return Object.entries(this.#state.sessions)
+      .filter(([, boundSessionId]) => typeof boundSessionId === 'string' && boundSessionId.length > 0)
+      .map(([key]) => key);
+  }
+
   hasSeen(messageId) {
     return this.#state.seenMessageIds.includes(messageId);
   }

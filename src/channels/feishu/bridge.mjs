@@ -412,6 +412,7 @@ export class FeishuHarnessBridge {
   #approvals;
   #status;
   #allowedSenderOpenIds;
+  #ownerOpenIds;
   #replyTimeoutMs;
   #logger;
   #signal;
@@ -438,6 +439,14 @@ export class FeishuHarnessBridge {
   #observedCompletionEvents = new Map();
   /** Earliest completion that still needs delivery for each watch. */
   #failedWatchSeqs = new Map();
+  /** Active computer-initiated streaming push per session (bound-session mirroring). */
+  #computerStreams = new Map();
+  /** Sessions that already notified the owner about a completed unbound turn (dedupe). */
+  #notifiedUnboundSessions = new Set();
+  /** Conversation key → { chatId } so bound sessions can push to their Feishu chat. */
+  #keyChats = new Map();
+  /** Session → latest computer-initiated turn start (for unbound completion notices). */
+  #computerTurnStarts = new Map();
   #cardDataTimeoutMs;
 
   constructor({
@@ -447,6 +456,7 @@ export class FeishuHarnessBridge {
     state,
     status,
     allowedSenderOpenIds = new Set(),
+    ownerOpenIds = [],
     botId,
     appId,
     botOpenId,
@@ -483,6 +493,9 @@ export class FeishuHarnessBridge {
     this.#state = state;
     this.#status = status;
     this.#allowedSenderOpenIds = allowedSenderOpenIds;
+    this.#ownerOpenIds = Array.isArray(ownerOpenIds)
+      ? ownerOpenIds.filter((value) => typeof value === 'string' && value && value !== '*')
+      : [];
     this.#botId = nonEmptyString(botId);
     this.#appId = nonEmptyString(appId);
     this.#botOpenId = nonEmptyString(botOpenId);
@@ -542,6 +555,15 @@ export class FeishuHarnessBridge {
       this.#status.messagesRejected += 1;
       this.#status.lastRejectedAt = new Date().toISOString();
       return Promise.resolve();
+    }
+
+    const eventChatId = nonEmptyString(event.message.chat_id);
+    if (eventChatId) {
+      this.#keyChats.set(key, { chatId: eventChatId });
+      if (this.#keyChats.size > 2000) {
+        const oldest = this.#keyChats.keys().next().value;
+        if (oldest !== undefined) this.#keyChats.delete(oldest);
+      }
     }
 
     if (event.message.chat_type === 'p2p') {
@@ -2907,21 +2929,256 @@ export class FeishuHarnessBridge {
       || !sessionId
       || !event
       || typeof event !== 'object'
-      || event.type !== 'turn/end'
       || !validEventSeq(event.seq)) return;
-    // Record before consulting state: /watch may still be resolving its target
-    // or waiting for setWatch persistence and therefore have no visible entry.
-    this.#recordObservedCompletion(sessionId, event);
-    void this.#queueEventTask(sessionId, async () => {
-      const keys = this.#state.keysWatching?.(sessionId) ?? [];
-      const needsBaseline = keys.some((key) => (
-        watchNeedsBaseline(this.#state.watchEntry?.(key, sessionId))
-      ));
-      const hasFailedDelivery = keys
-        .some((key) => this.#failedWatchSeqs.has(`${key}\0${sessionId}`));
-      if (needsBaseline || hasFailedDelivery) await this.#compensateSession(sessionId);
-      await this.#deliverCompletion(sessionId, event);
+
+    if (event.type === 'turn/end') {
+      // Record before consulting state: /watch may still be resolving its target
+      // or waiting for setWatch persistence and therefore have no visible entry.
+      this.#recordObservedCompletion(sessionId, event);
+      void this.#queueEventTask(sessionId, async () => {
+        const keys = this.#state.keysWatching?.(sessionId) ?? [];
+        const needsBaseline = keys.some((key) => (
+          watchNeedsBaseline(this.#state.watchEntry?.(key, sessionId))
+        ));
+        const hasFailedDelivery = keys
+          .some((key) => this.#failedWatchSeqs.has(`${key}\0${sessionId}`));
+        if (needsBaseline || hasFailedDelivery) await this.#compensateSession(sessionId);
+        await this.#deliverCompletion(sessionId, event);
+      });
+      // Computer-initiated bound-session turns finalize their mirror stream.
+      void this.#finalizeBoundSessionTurn(sessionId, event);
+      // Unbound sessions (not bound to any Feishu chat and not watched) notify
+      // the bot owner that a computer-side task completed.
+      void this.#notifyUnboundCompletion(sessionId, event);
+      return;
+    }
+
+    // Mirror computer-initiated turns running on a session bound to a Feishu
+    // chat: open a streaming card and keep it updated as the turn progresses.
+    void this.#mirrorBoundSessionTurn(sessionId, event);
+  }
+
+  /** Discriminate a computer-side prompt from one originated by this bot. */
+  #isComputerInitiatedUserMessage(event) {
+    const source = event?.data?.source;
+    if (!source || typeof source !== 'object') return false;
+    const rpcId = source.rpcId;
+    if (typeof rpcId !== 'string' || !rpcId) return false;
+    // dsh-im prompts always carry the "im-" rpcId prefix; anything else comes
+    // from the desktop/web client (computer side).
+    return !rpcId.startsWith('im-');
+  }
+
+  /** Mirror (stream) one event of a computer-initiated turn on a bound session. */
+  async #mirrorBoundSessionTurn(sessionId, event) {
+    if (this.#signal?.aborted) return;
+    try {
+      if (event.type === 'turn/start') {
+        // Reset any stale mirror from a previous interrupted turn.
+        this.#computerStreams.delete(sessionId);
+        this.#computerStreams.set(sessionId, { openTurn: event.data?.turn ?? null });
+        return;
+      }
+      if (event.type === 'user/message') {
+        const entry = this.#computerStreams.get(sessionId);
+        if (!entry) return;
+        entry.turn = event.data?.turn ?? entry.openTurn;
+        const computerInitiated = this.#isComputerInitiatedUserMessage(event);
+        if (computerInitiated) {
+          // Remember that a computer-side prompt opened a turn in this session,
+          // so an unbound-session completion can notify the owner. Bound for size.
+          this.#computerTurnStarts.set(sessionId, {
+            turn: entry.turn,
+            at: Date.now(),
+          });
+          if (this.#computerTurnStarts.size > 500) {
+            const oldestKey = this.#computerTurnStarts.keys().next().value;
+            if (oldestKey !== undefined) this.#computerTurnStarts.delete(oldestKey);
+          }
+        }
+        if (!computerInitiated) {
+          // A Feishu-originated prompt on this session; the normal ask path
+          // already streams it. Leave the mirror inactive.
+          entry.remote = true;
+          return;
+        }
+        const boundKeys = this.#state.keysBoundTo?.(sessionId) ?? [];
+        const target = this.#boundChatTarget(boundKeys);
+        if (!target) {
+          entry.remote = true;
+          return;
+        }
+        entry.remote = false;
+        await this.#openBoundStream(sessionId, entry, target, event);
+        return;
+      }
+      const entry = this.#computerStreams.get(sessionId);
+      if (!entry || entry.remote || entry.turn === undefined || entry.controller === undefined) return;
+      if (event.data?.turn !== undefined && event.data.turn !== entry.turn) return;
+      if (event.type === 'assistant/chunk' && event.data?.chunk?.type === 'text-delta') {
+        const step = event.data?.step ?? 0;
+        const index = event.data.chunk.index ?? 0;
+        entry.parts ??= new Map();
+        entry.parts.set(`${step}:${index}`, (entry.parts.get(`${step}:${index}`) ?? '') + event.data.chunk.text);
+        const prefix = `${step}:`;
+        const text = [...entry.parts.entries()]
+          .filter(([partKey]) => partKey.startsWith(prefix))
+          .sort(([left], [right]) => Number(left.split(':')[1]) - Number(right.split(':')[1]))
+          .map(([, part]) => part)
+          .join('\n')
+          .trim();
+        if (text && text !== entry.latestText) {
+          entry.latestText = text;
+          await this.#updateBoundStream(entry, text);
+        }
+        return;
+      }
+      if (event.type === 'assistant/message') {
+        const text = assistantMessageText(event);
+        if (text && text !== entry.latestText) {
+          entry.latestText = text;
+          await this.#updateBoundStream(entry, text);
+        }
+        return;
+      }
+      if (event.type === 'tool/call') {
+        const name = nonEmptyText(event.data?.name) ?? t('工具');
+        await this.#updateBoundStream(entry, t('_正在使用 {name}…_', { name }));
+      }
+    } catch (error) {
+      if (!this.#signal?.aborted) {
+        this.#logger.warn?.('[dsh-feishu] bound-session mirror stream failed:', error.message);
+      }
+      this.#computerStreams.delete(sessionId);
+    }
+  }
+
+  /** Open the streaming card on the chat(s) bound to this session. */
+  async #openBoundStream(sessionId, entry, target, event) {
+    if (!this.#channel?.stream) return;
+    const { chatId, key } = target;
+    let stream;
+    try {
+      stream = await this.#channel.stream(chatId, {
+        markdown: async (controller) => {
+          entry.controller = controller;
+          const text = nonEmptyText(event?.data?.message?.content?.[0]?.text)
+            ?? t('电脑端发起了新任务，正在思考…');
+          await controller.setContent(text);
+        },
+      });
+      entry.messageId = stream?.messageId ?? null;
+      this.#status.boundStreams = (this.#status.boundStreams ?? 0) + 1;
+    } catch (error) {
+      this.#logger.warn?.('[dsh-feishu] bound-session stream open failed:', error.message);
+      this.#computerStreams.delete(sessionId);
+    }
+  }
+
+  /** Update an open bound-session streaming card. */
+  async #updateBoundStream(entry, text) {
+    if (!entry?.controller || typeof entry.controller.setContent !== 'function') return;
+    await entry.controller.setContent(text);
+  }
+
+  /** Resolve the Feishu chat target bound to a session (first bound key). */
+  #boundChatTarget(boundKeys) {
+    for (const key of boundKeys) {
+      const chat = this.#keyChats.get(key);
+      if (chat?.chatId) return { chatId: chat.chatId, key };
+    }
+    // Group conversation keys embed the chat_id, so a bound group survives a
+    // Host restart even before the first inbound message of the new process.
+    for (const key of boundKeys) {
+      if (typeof key === 'string' && key.startsWith('group:')) {
+        const chatId = key.slice('group:'.length);
+        if (chatId) return { chatId, key };
+      }
+    }
+    return null;
+  }
+
+  /** Finalize (or abandon) the mirror stream when the computer turn ends. */
+  async #finalizeBoundSessionTurn(sessionId, event) {
+    const entry = this.#computerStreams.get(sessionId);
+    if (!entry || entry.remote) return;
+    try {
+      if (entry.controller && typeof entry.controller.setContent === 'function') {
+        const finalText = entry.latestText
+          ?? t('_任务已完成（无文字回复）。_');
+        await entry.controller.setContent(finalText);
+      }
+    } catch (error) {
+      if (!this.#signal?.aborted) {
+        this.#logger.warn?.('[dsh-feishu] bound-session stream finalize failed:', error.message);
+      }
+    } finally {
+      this.#computerStreams.delete(sessionId);
+      this.#computerTurnStarts.delete(sessionId);
+    }
+  }
+
+  /** Notify the bot owner that a computer-side task on an unbound session completed. */
+  async #notifyUnboundCompletion(sessionId, event) {
+    if (this.#signal?.aborted || this.#ownerOpenIds.length === 0) return;
+    if (this.#notifiedUnboundSessions.has(sessionId)) return;
+    // Only turns that were started by the computer (not this bot's own ask)
+    // are candidates for an owner completion notice.
+    const turned = this.#computerTurnStarts.get(sessionId);
+    if (!turned) return;
+    try {
+      const boundKeys = this.#state.keysBoundTo?.(sessionId) ?? [];
+      const watchedKeys = this.#state.keysWatching?.(sessionId) ?? [];
+      // Only unbound (and unwatched) sessions qualify: their progress has no
+      // Feishu chat to surface in.
+      if (boundKeys.length > 0 || watchedKeys.length > 0) return;
+      const reason = event?.data?.reason?.kind ?? event?.data?.reason ?? null;
+      if (reason !== 'completed' && reason !== null) return;
+
+      const ownerOpenId = this.#ownerOpenIds[0];
+      const title = await this.#sessionTitle(sessionId);
+      const text = t('✅ 电脑端的任务已完成\n**{title}**\n`{id}`', {
+        title: String(title ?? t('暂无标题')).replace(/\s+/gu, ' '),
+        id: sessionId,
+      });
+      await this.#sendToOwner(ownerOpenId, text);
+      this.#notifiedUnboundSessions.add(sessionId);
+      this.#computerTurnStarts.delete(sessionId);
+      this.#status.ownerNotices = (this.#status.ownerNotices ?? 0) + 1;
+      // Bound the dedupe set so it cannot grow unbounded.
+      if (this.#notifiedUnboundSessions.size > 500) {
+        const oldest = this.#notifiedUnboundSessions.values().next().value;
+        if (oldest !== undefined) this.#notifiedUnboundSessions.delete(oldest);
+      }
+    } catch (error) {
+      if (!this.#signal?.aborted) {
+        this.#logger.warn?.('[dsh-feishu] unbound completion notice failed:', error.message);
+      }
+    }
+  }
+
+  async #sessionTitle(sessionId) {
+    try {
+      const session = this.#harness.workspaceSession?.(sessionId);
+      if (typeof session?.title === 'string' && session.title) return session.title;
+      if (typeof session?.name === 'string' && session.name) return session.name;
+    } catch { /* fall through to null */ }
+    return null;
+  }
+
+  /** Send a plain text message to a user's private chat with the bot. */
+  async #sendToOwner(ownerOpenId, text) {
+    const response = await this.#client.im.v1.message.create({
+      params: { receive_id_type: 'open_id' },
+      data: {
+        receive_id: ownerOpenId,
+        msg_type: 'text',
+        content: JSON.stringify({ text }),
+      },
     });
+    if (response?.code && response.code !== 0) {
+      throw new Error(`Feishu owner notice failed: ${response.msg || response.code}`);
+    }
   }
 
   async #deliverCompletion(sessionId, event, { keys: targetKeys = null } = {}) {
