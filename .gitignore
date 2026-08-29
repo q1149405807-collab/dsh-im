@@ -7,3 +7,15 @@ coverage/
 *.tgz
 .DS_Store
 .idea/
+
+# local debug scripts (2026-08-29 cleanup)
+*.mjs
+*.extracted
+*.patched
+*.v2
+.smoke-state.json
+.verify-state.json
+lib-modded-index.js
+lib-official-index.js
+node_modules.pnpm/
+.debug-backup-*/
