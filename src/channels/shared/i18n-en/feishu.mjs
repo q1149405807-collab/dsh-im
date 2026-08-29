@@ -337,6 +337,17 @@ export default {
   '回答完成': 'Answer complete',
   '飞书机器人': 'Feishu bot',
 
+  // feishu/bridge.mjs — bound-session mirror streaming card (ZCode-style)
+  '⏳ 运行中': '⏳ Running',
+  '✅ 已完成': '✅ Completed',
+  '失败': 'Failed',
+  '完成': 'Completed',
+  '正在处理...': 'Working...',
+  '工具摘要': 'Tool calls',
+  '电脑端发起了新任务，正在思考…': 'A new task was started on the desktop; thinking…',
+  '任务已完成（无文字回复）。': 'The task completed without a text reply.',
+  '任务失败：{message}': 'The task failed: {message}',
+
   // feishu/message-utils.mjs
   '飞书机器人缺少图片读取权限 im:message:readonly（飞书显示为“获取单聊、群组消息”）。请私聊机器人执行 /repair 命令，或者在「IM机器人」设置页点击“补全权限”按钮并扫码。按飞书提示发布新版本、完成必要审批后，再重新发送图片。':
     'The Feishu bot is missing the image-read scope im:message:readonly, shown by Feishu as “Read direct and group messages.” Run /repair in a direct chat with the bot, or click the “Complete permissions” button on the IM Bot settings page and scan the QR code. Publish a new version and complete any approval requested by Feishu, then resend the image.',

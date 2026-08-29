@@ -186,6 +186,184 @@ function nonEmptyString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
+/** Trimmed text or null. Same contract as harness-client's private helper. */
+function nonEmptyText(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+/** Join the text parts of an assistant message payload. */
+function assistantMessageText(event) {
+  return (event?.data?.message?.content ?? [])
+    .filter((part) => part.type === 'text' && typeof part.text === 'string')
+    .map((part) => part.text)
+    .join('\n')
+    .trim();
+}
+
+/** Flatten a tool/result error payload into a one-line displayable reason. */
+function toolResultErrorText(error) {
+  if (!error || typeof error !== 'object') return null;
+  const message = nonEmptyText(error.message)
+    ?? [nonEmptyText(error.name), nonEmptyText(error.code)].filter(Boolean).join(': ');
+  if (!message) return null;
+  const line = message.replace(/\s+/gu, ' ').trim();
+  return line.length > 120 ? `${line.slice(0, 119)}…` : line;
+}
+
+/** Minimum gap between two non-forced mirror card PATCHes. */
+const MIRROR_SYNC_MIN_INTERVAL_MS = 1_000;
+/** Single mirror card PATCH budget before the attempt is abandoned. */
+const MIRROR_SYNC_TIMEOUT_MS = 15_000;
+/** Consecutive mirror sync failures that freeze the card until the turn ends. */
+const MIRROR_SYNC_MAX_FAILURES = 3;
+/** Exponential backoff base between mirror sync retries. */
+const MIRROR_SYNC_RETRY_BASE_MS = 1_000;
+/** Total streamed text kept in one mirror card (Feishu cards cap at ~30 KB). */
+const MIRROR_MAX_TEXT_CHARS = 20_000;
+/** Tool calls retained per mirror card before the oldest are dropped. */
+const MIRROR_MAX_TOOL_CALLS = 50;
+/** One-line head+tail preview of tool arguments inside the tool panel. */
+const MIRROR_PREVIEW_CHARS = 80;
+/** User prompt quoted at the top of a mirror card. */
+const MIRROR_PROMPT_CHARS = 160;
+
+const MIRROR_STATUS_TEXT = {
+  running: () => t('⏳ 运行中'),
+  completed: () => t('✅ 已完成'),
+  failed: () => t('失败'),
+};
+
+const MIRROR_TOOL_STATUS_TEXT = {
+  running: () => t('⏳ 运行中'),
+  completed: () => t('完成'),
+  failed: () => t('失败'),
+};
+
+/** Feishu card markdown needs two trailing spaces for hard line breaks
+ * (outside code fences) and blank lines around horizontal rules. */
+function mirrorCardMarkdown(text) {
+  const rows = [];
+  let inCode = false;
+  for (const line of String(text ?? '').split('\n')) {
+    if (line.trimStart().startsWith('```')) inCode = !inCode;
+    if (!inCode && /^-{3,}$/u.test(line.trim())) {
+      if (rows.length > 0 && rows.at(-1).text !== '') rows.push({ text: '' });
+      rows.push({ text: '---' }, { text: '' });
+      continue;
+    }
+    rows.push({ text: line, hardBreak: !inCode });
+  }
+  return rows
+    .map((row, index) => {
+      if (!row.text || !row.hardBreak || index >= rows.length - 1 || !rows[index + 1].text) {
+        return row.text;
+      }
+      return `${row.text}  `;
+    })
+    .join('\n');
+}
+
+/** Common argument keys whose value reads better than raw JSON in previews. */
+const MIRROR_PREVIEW_KEYS = [
+  'cmd', 'command', 'query', 'q', 'url', 'pattern', 'prompt', 'path',
+  'file_path', 'filePath', 'session', 'sessionId', 'workspacePath',
+];
+
+/** Middle-truncated single-line preview, ZCode style (65% head / 35% tail). */
+function mirrorArgumentPreview(args) {
+  let text = '';
+  if (typeof args === 'string') text = args;
+  else if (args && typeof args === 'object' && Object.keys(args).length > 0) {
+    // Prefer the most descriptive common key over a raw JSON dump.
+    for (const key of MIRROR_PREVIEW_KEYS) {
+      const value = args[key];
+      if (typeof value === 'string' && value.trim()) {
+        text = value;
+        break;
+      }
+    }
+    if (!text) {
+      try {
+        text = JSON.stringify(args);
+      } catch {
+        text = '';
+      }
+    }
+  }
+  text = text.replace(/\s+/gu, ' ').trim();
+  if (!text) return null;
+  if (text.length > MIRROR_PREVIEW_CHARS) {
+    const head = Math.ceil((MIRROR_PREVIEW_CHARS - 5) * 0.65);
+    const tail = Math.max(0, MIRROR_PREVIEW_CHARS - 5 - head);
+    text = `${text.slice(0, head)} ... ${tail > 0 ? text.slice(text.length - tail) : ''}`;
+  }
+  return text.replace(/\\/gu, '\\\\').replace(/`/gu, '\\`');
+}
+
+function mirrorToolLine(call) {
+  const status = MIRROR_TOOL_STATUS_TEXT[call.status]?.() ?? MIRROR_TOOL_STATUS_TEXT.running();
+  let line = `- ${status} · ${call.name}`;
+  if (call.preview) line += ` · \`${call.preview}\``;
+  if (call.status === 'failed' && call.error) line += `：${call.error}`;
+  return line;
+}
+
+/** ZCode-style collapsible tool panel: grey card, right chevron, count badge. */
+function mirrorToolPanel(calls, expanded) {
+  const lines = calls.map(mirrorToolLine);
+  return {
+    tag: 'collapsible_panel',
+    expanded,
+    background_color: 'grey-50',
+    border: { color: 'grey', corner_radius: '8px' },
+    padding: '8px 8px 8px 8px',
+    header: {
+      title: { tag: 'plain_text', content: `🛠️ ${t('工具摘要')} (${lines.length})` },
+      vertical_align: 'center',
+      padding: '8px 8px 8px 8px',
+      icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', color: 'grey', size: '16px 16px' },
+      icon_position: 'right',
+      icon_expanded_angle: -180,
+    },
+    elements: [{ tag: 'markdown', content: mirrorCardMarkdown(lines.join('\n')) }],
+  };
+}
+
+/** Render the mirror state into a card 2.0 payload (ZCode buildFeishuStreamingCardPayload). */
+function mirrorCardPayload(entry) {
+  const lastToolsIndex = (() => {
+    for (let index = entry.blocks.length - 1; index >= 0; index -= 1) {
+      if (entry.blocks[index].type === 'tools') return index;
+    }
+    return -1;
+  })();
+  const elements = [];
+  let budget = MIRROR_MAX_TEXT_CHARS;
+  for (const block of entry.blocks) {
+    if (block.type === 'message' || block.type === 'header') {
+      const text = block.text.trim();
+      if (!text || budget <= 0) continue;
+      const content = text.length > budget ? `${text.slice(0, budget - 1)}…` : text;
+      budget -= content.length;
+      elements.push({ tag: 'markdown', content: mirrorCardMarkdown(content) });
+      continue;
+    }
+    const calls = block.callIds
+      .map((callId) => entry.toolCalls.get(callId))
+      .filter(Boolean);
+    if (calls.length === 0) continue;
+    elements.push(mirrorToolPanel(calls, entry.status === 'running' && block === entry.blocks[lastToolsIndex]));
+  }
+  if (elements.length === 0) elements.push({ tag: 'markdown', content: t('正在处理...') });
+  const statusText = MIRROR_STATUS_TEXT[entry.status]?.() ?? MIRROR_STATUS_TEXT.running();
+  elements.push({ tag: 'markdown', content: `_${statusText}_` });
+  return {
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    body: { elements },
+  };
+}
+
 /** Accept SDK payload fields that may already be objects or JSON strings. */
 function callbackObject(value) {
   if (value && typeof value === 'object' && !Array.isArray(value)) return value;
@@ -2149,6 +2327,9 @@ export class FeishuHarnessBridge {
 
   async #sendCard(chatId, cardJson, options = {}) {
     const updateMessageId = nonEmptyString(options.updateMessageId);
+    // Mirror targets may carry a p2p open_id (cold chat cache); everything
+    // else addresses a real chat_id.
+    const receiveIdType = options.receiveIdType === 'open_id' ? 'open_id' : 'chat_id';
 
     if (updateMessageId) {
       try {
@@ -2167,7 +2348,7 @@ export class FeishuHarnessBridge {
     }
 
     const response = await this.#client.im.v1.message.create({
-      params: { receive_id_type: 'chat_id' },
+      params: { receive_id_type: receiveIdType },
       data: { receive_id: chatId, msg_type: 'interactive', content: cardJson },
     });
     if (response?.code && response.code !== 0) {
@@ -2946,7 +3127,9 @@ export class FeishuHarnessBridge {
         await this.#deliverCompletion(sessionId, event);
       });
       // Computer-initiated bound-session turns finalize their mirror stream.
-      void this.#finalizeBoundSessionTurn(sessionId, event);
+      // Queued behind the mirror events of the same session so the final card
+      // update renders after every streamed chunk has landed.
+      void this.#queueEventTask(sessionId, () => this.#finalizeBoundSessionTurn(sessionId, event));
       // Unbound sessions (not bound to any Feishu chat and not watched) notify
       // the bot owner that a computer-side task completed.
       void this.#notifyUnboundCompletion(sessionId, event);
@@ -2955,18 +3138,26 @@ export class FeishuHarnessBridge {
 
     // Mirror computer-initiated turns running on a session bound to a Feishu
     // chat: open a streaming card and keep it updated as the turn progresses.
-    void this.#mirrorBoundSessionTurn(sessionId, event);
+    // The per-session queue serializes mirror events so card syncs apply
+    // backpressure (one PATCH in flight per chat) like ZCode's stream loop.
+    void this.#queueEventTask(sessionId, () => this.#mirrorBoundSessionTurn(sessionId, event));
   }
 
-  /** Discriminate a computer-side prompt from one originated by this bot. */
+  /**
+   * Classify a user/message event by prompt origin. Returns true for a
+   * computer-side prompt (desktop/web/automation: any rpcId not owned by this
+   * bot), false for this bot's own Feishu ask (rpcId "feishu-<uuid>" — the
+   * feishu channel's rpcIdPrefix, not the shared "im" default), and null for
+   * host-injected context messages which carry no source at all and must
+   * neither activate nor deactivate the mirror.
+   */
   #isComputerInitiatedUserMessage(event) {
     const source = event?.data?.source;
-    if (!source || typeof source !== 'object') return false;
+    if (!source || typeof source !== 'object') return null;
     const rpcId = source.rpcId;
-    if (typeof rpcId !== 'string' || !rpcId) return false;
-    // dsh-im prompts always carry the "im-" rpcId prefix; anything else comes
-    // from the desktop/web client (computer side).
-    return !rpcId.startsWith('im-');
+    if (typeof rpcId !== 'string' || !rpcId) return null;
+    if (rpcId.startsWith('feishu-')) return false;
+    return true;
   }
 
   /** Mirror (stream) one event of a computer-initiated turn on a bound session. */
@@ -2976,15 +3167,34 @@ export class FeishuHarnessBridge {
       if (event.type === 'turn/start') {
         // Reset any stale mirror from a previous interrupted turn.
         this.#computerStreams.delete(sessionId);
-        this.#computerStreams.set(sessionId, { openTurn: event.data?.turn ?? null });
+        this.#computerStreams.set(sessionId, {
+          openTurn: event.data?.turn ?? null,
+          blocks: [],
+          toolCalls: new Map(),
+          status: 'running',
+          messageId: null,
+          target: null,
+          latestText: '',
+          parts: new Map(),
+          syncTail: null,
+          lastSyncAt: 0,
+          failures: 0,
+          backoffUntil: 0,
+          dead: false,
+        });
         return;
       }
+      const entry = this.#computerStreams.get(sessionId);
+      if (!entry) return;
       if (event.type === 'user/message') {
-        const entry = this.#computerStreams.get(sessionId);
-        if (!entry) return;
         entry.turn = event.data?.turn ?? entry.openTurn;
-        const computerInitiated = this.#isComputerInitiatedUserMessage(event);
-        if (computerInitiated) {
+        const origin = this.#isComputerInitiatedUserMessage(event);
+        if (origin === null) {
+          // Host-injected context message (no source): part of the current
+          // turn but not a prompt — never flips the mirror's origin state.
+          return;
+        }
+        if (origin) {
           // Remember that a computer-side prompt opened a turn in this session,
           // so an unbound-session completion can notify the owner. Bound for size.
           this.#computerTurnStarts.set(sessionId, {
@@ -2995,8 +3205,7 @@ export class FeishuHarnessBridge {
             const oldestKey = this.#computerTurnStarts.keys().next().value;
             if (oldestKey !== undefined) this.#computerTurnStarts.delete(oldestKey);
           }
-        }
-        if (!computerInitiated) {
+        } else {
           // A Feishu-originated prompt on this session; the normal ask path
           // already streams it. Leave the mirror inactive.
           entry.remote = true;
@@ -3009,17 +3218,20 @@ export class FeishuHarnessBridge {
           return;
         }
         entry.remote = false;
-        await this.#openBoundStream(sessionId, entry, target, event);
+        entry.target = target;
+        this.#openBoundStream(entry, event);
+        await this.#syncMirrorCard(entry, { force: true });
         return;
       }
-      const entry = this.#computerStreams.get(sessionId);
-      if (!entry || entry.remote || entry.turn === undefined || entry.controller === undefined) return;
+      if (entry.remote || entry.turn === undefined || !entry.target) return;
       if (event.data?.turn !== undefined && event.data.turn !== entry.turn) return;
       if (event.type === 'assistant/chunk' && event.data?.chunk?.type === 'text-delta') {
         const step = event.data?.step ?? 0;
         const index = event.data.chunk.index ?? 0;
-        entry.parts ??= new Map();
-        entry.parts.set(`${step}:${index}`, (entry.parts.get(`${step}:${index}`) ?? '') + event.data.chunk.text);
+        const key = `${step}:${index}`;
+        entry.parts.set(key, (entry.parts.get(key) ?? '') + event.data.chunk.text);
+        // Rebuild the streamed text from ordered parts, then sync the delta
+        // into the mirror blocks so the card matches the desktop transcript.
         const prefix = `${step}:`;
         const text = [...entry.parts.entries()]
           .filter(([partKey]) => partKey.startsWith(prefix))
@@ -3028,22 +3240,66 @@ export class FeishuHarnessBridge {
           .join('\n')
           .trim();
         if (text && text !== entry.latestText) {
+          const delta = text.startsWith(entry.latestText)
+            ? text.slice(entry.latestText.length)
+            : text;
           entry.latestText = text;
-          await this.#updateBoundStream(entry, text);
+          this.#appendMirrorText(entry, delta);
+          await this.#syncMirrorCard(entry);
         }
         return;
       }
       if (event.type === 'assistant/message') {
+        // Safety net for dropped deltas: reconcile the trailing message block
+        // when the authoritative message text supersedes the streamed one.
         const text = assistantMessageText(event);
-        if (text && text !== entry.latestText) {
+        if (!text || text === entry.latestText) return;
+        const last = entry.blocks.at(-1);
+        if (last?.type === 'message' && text.startsWith(last.text.trim().slice(0, 64))) {
           entry.latestText = text;
-          await this.#updateBoundStream(entry, text);
+          last.text = text;
+          await this.#syncMirrorCard(entry);
         }
         return;
       }
       if (event.type === 'tool/call') {
+        const callId = nonEmptyText(event.data?.callId) ?? nonEmptyText(event.data?.subCallId);
+        if (!callId || entry.toolCalls.has(callId)) {
+          if (callId) await this.#syncMirrorCard(entry);
+          return;
+        }
         const name = nonEmptyText(event.data?.name) ?? t('工具');
-        await this.#updateBoundStream(entry, t('_正在使用 {name}…_', { name }));
+        entry.toolCalls.set(callId, {
+          name,
+          status: 'running',
+          preview: mirrorArgumentPreview(event.data?.arguments),
+          error: null,
+        });
+        const last = entry.blocks.at(-1);
+        if (last?.type === 'tools') last.callIds.push(callId);
+        else entry.blocks.push({ type: 'tools', callIds: [callId] });
+        if (entry.toolCalls.size > MIRROR_MAX_TOOL_CALLS) {
+          const oldest = entry.toolCalls.keys().next().value;
+          entry.toolCalls.delete(oldest);
+          for (const block of entry.blocks) {
+            if (block.type === 'tools') {
+              block.callIds = block.callIds.filter((id) => entry.toolCalls.has(id));
+            }
+          }
+        }
+        await this.#syncMirrorCard(entry, { force: true });
+        return;
+      }
+      if (event.type === 'tool/result') {
+        const callId = nonEmptyText(event.data?.message?.source?.callId)
+          ?? nonEmptyText(event.data?.callId)
+          ?? nonEmptyText(event.data?.subCallId);
+        const call = callId ? entry.toolCalls.get(callId) : null;
+        if (!call) return;
+        const error = toolResultErrorText(event.data?.error);
+        call.status = error ? 'failed' : 'completed';
+        call.error = error;
+        await this.#syncMirrorCard(entry, { force: true });
       }
     } catch (error) {
       if (!this.#signal?.aborted) {
@@ -3053,32 +3309,98 @@ export class FeishuHarnessBridge {
     }
   }
 
-  /** Open the streaming card on the chat(s) bound to this session. */
-  async #openBoundStream(sessionId, entry, target, event) {
-    if (!this.#channel?.stream) return;
-    const { chatId, key } = target;
-    let stream;
-    try {
-      stream = await this.#channel.stream(chatId, {
-        markdown: async (controller) => {
-          entry.controller = controller;
-          const text = nonEmptyText(event?.data?.message?.content?.[0]?.text)
-            ?? t('电脑端发起了新任务，正在思考…');
-          await controller.setContent(text);
-        },
-      });
-      entry.messageId = stream?.messageId ?? null;
-      this.#status.boundStreams = (this.#status.boundStreams ?? 0) + 1;
-    } catch (error) {
-      this.#logger.warn?.('[dsh-feishu] bound-session stream open failed:', error.message);
-      this.#computerStreams.delete(sessionId);
-    }
+  /** Append a streamed text delta to the trailing message block. */
+  #appendMirrorText(entry, delta) {
+    if (!delta) return;
+    const last = entry.blocks.at(-1);
+    if (last?.type === 'message') last.text += delta;
+    else entry.blocks.push({ type: 'message', text: delta });
   }
 
-  /** Update an open bound-session streaming card. */
-  async #updateBoundStream(entry, text) {
-    if (!entry?.controller || typeof entry.controller.setContent !== 'function') return;
-    await entry.controller.setContent(text);
+  /**
+   * Open the streaming card on the chat(s) bound to this session: the user's
+   * prompt is quoted as the header block, then the streamed answer and a
+   * collapsible tool-call panel follow, with a live status footer.
+   */
+  #openBoundStream(entry, event) {
+    // Live user/message events carry the prompt in data.content (a content
+    // part array); data.message.content is only a defensive fallback.
+    const parts = event?.data?.content ?? event?.data?.message?.content;
+    const prompt = nonEmptyText(Array.isArray(parts)
+      ? parts.find((part) => part?.type === 'text' && typeof part.text === 'string')?.text
+      : null);
+    const header = prompt
+      ? prompt.replace(/\s+/gu, ' ').slice(0, MIRROR_PROMPT_CHARS)
+      : t('电脑端发起了新任务，正在思考…');
+    // Distinct block type so streamed deltas start their own message block
+    // instead of being appended into the quoted prompt.
+    entry.blocks.push({ type: 'header', text: `**${header}**` });
+  }
+
+  /**
+   * Sync the mirror card once: create it on the first call, then PATCH the
+   * same message. Mirrors ZCode's syncStreamingCardReply: non-forced syncs are
+   * throttled to one PATCH per second, failures back off exponentially and a
+   * circuit opens after repeated failures so the turn is never blocked.
+   */
+  #syncMirrorCard(entry, { force = false } = {}) {
+    if (!entry.target || entry.dead) return entry.syncTail ?? Promise.resolve();
+    const now = Date.now();
+    if (entry.backoffUntil > now) return entry.syncTail ?? Promise.resolve();
+    if (entry.messageId && !force && now - entry.lastSyncAt < MIRROR_SYNC_MIN_INTERVAL_MS) {
+      return entry.syncTail ?? Promise.resolve();
+    }
+    const operation = entry.messageId ? 'update' : 'create';
+    entry.syncTail = (entry.syncTail ?? Promise.resolve()).catch(() => {}).then(async () => {
+      if (entry.dead || this.#signal?.aborted) return;
+      const payload = JSON.stringify(mirrorCardPayload(entry));
+      const controller = new AbortController();
+      const timer = setTimeout(
+        () => controller.abort(new Error('Feishu mirror card sync timed out.')),
+        MIRROR_SYNC_TIMEOUT_MS,
+      );
+      try {
+        const messageId = await Promise.race([
+          this.#sendCard(entry.target.chatId, payload, {
+            updateMessageId: entry.messageId,
+            receiveIdType: entry.target.receiveIdType,
+          }),
+          new Promise((_, reject) => {
+            controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true });
+          }),
+        ]);
+        const created = !entry.messageId;
+        entry.messageId = nonEmptyString(messageId) ?? entry.messageId;
+        if (created && entry.messageId) {
+          this.#status.boundStreams = (this.#status.boundStreams ?? 0) + 1;
+        }
+        entry.lastSyncAt = Date.now();
+        entry.failures = 0;
+        entry.backoffUntil = 0;
+      } catch (error) {
+        entry.failures += 1;
+        if (entry.failures >= MIRROR_SYNC_MAX_FAILURES) {
+          entry.dead = true;
+          if (!this.#signal?.aborted) {
+            this.#logger.warn?.(
+              `[dsh-feishu] mirror card circuit opened ${operation} chat=${entry.target.chatId}:`,
+              error?.message ?? error,
+            );
+          }
+        } else {
+          entry.backoffUntil = Date.now() + MIRROR_SYNC_RETRY_BASE_MS * 2 ** (entry.failures - 1);
+          if (!this.#signal?.aborted) {
+            this.#logger.warn?.(
+              `[dsh-feishu] mirror card sync failed ${operation}, retrying:`,
+              error?.message ?? error,
+            );
+          }
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    });
+    return entry.syncTail;
   }
 
   /** Resolve the Feishu chat target bound to a session (first bound key). */
@@ -3095,6 +3417,14 @@ export class FeishuHarnessBridge {
         if (chatId) return { chatId, key };
       }
     }
+    // P2P keys embed the user's open_id, which the API accepts directly — so a
+    // p2p binding also survives a restart with a cold in-memory chat cache.
+    for (const key of boundKeys) {
+      if (typeof key === 'string' && key.startsWith('p2p:ou_')) {
+        const openId = key.slice('p2p:'.length);
+        if (openId) return { chatId: openId, key, receiveIdType: 'open_id' };
+      }
+    }
     return null;
   }
 
@@ -3103,11 +3433,20 @@ export class FeishuHarnessBridge {
     const entry = this.#computerStreams.get(sessionId);
     if (!entry || entry.remote) return;
     try {
-      if (entry.controller && typeof entry.controller.setContent === 'function') {
-        const finalText = entry.latestText
-          ?? t('_任务已完成（无文字回复）。_');
-        await entry.controller.setContent(finalText);
+      const reason = event?.data?.reason?.kind ?? event?.data?.reason ?? null;
+      entry.status = reason && reason !== 'completed' ? 'failed' : 'completed';
+      if (reason && reason !== 'completed') {
+        // Surface the failure on the card itself: an empty turn gets an explicit
+        // error line, a streamed one keeps its text and just flips the footer.
+        const detail = nonEmptyText(event?.data?.reason?.message)
+          ?? nonEmptyText(event?.data?.error?.message);
+        if (!entry.latestText) {
+          this.#appendMirrorText(entry, t('任务失败：{message}', { message: detail ?? reason }));
+        }
+      } else if (!entry.latestText) {
+        this.#appendMirrorText(entry, t('任务已完成（无文字回复）。'));
       }
+      await this.#syncMirrorCard(entry, { force: true });
     } catch (error) {
       if (!this.#signal?.aborted) {
         this.#logger.warn?.('[dsh-feishu] bound-session stream finalize failed:', error.message);
